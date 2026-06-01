@@ -1,0 +1,9 @@
+[raspberrypis]
+# Replace with your Pi's IP address or hostname.
+# The user and port here must match the CURRENT values on the Pi
+# (i.e. before hardening).  After the playbook runs, update ansible_port
+# to match ssh_new_port (default: 2222).
+192.168.1.100 ansible_user=pi ansible_port=22
+
+# Multiple Pis — add one line per device:
+# 192.168.1.101 ansible_user=pi ansible_port=22

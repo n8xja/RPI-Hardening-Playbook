@@ -1,0 +1,1290 @@
+---
+###############################################################################
+# Raspberry Pi Security Hardening Playbook
+# Version : 1.3.0
+# Repo    : https://github.com/YOUR_USERNAME/rpi-security-hardening
+# Based on: https://ohyaan.github.io/tips/raspberry_pi_security_hardening_complete_guide/
+#
+# Changelog:
+#   1.3.0 — Add VIM installation, set as default editor, disable mouse tracking
+#   1.2.0 — Add log2ram support to protect SD card from log write wear
+#   1.1.0 — Add all hardening sections: SSH, firewall, kernel, AppArmor,
+#            AIDE, fail2ban, logwatch, daily scripts, port scan detection
+#   1.0.0 — Initial release: pre/post reporting, section toggle framework
+#
+# Usage:
+#   ansible-playbook -i inventory.ini rpi_harden.yml --ask-become-pass
+#   ansible-playbook -i inventory.ini rpi_harden.yml --tags report   # report only
+#   ansible-playbook -i inventory.ini rpi_harden.yml --tags harden   # harden only
+#   ansible-playbook -i inventory.ini rpi_harden.yml --check --diff  # dry run
+###############################################################################
+
+- name: Raspberry Pi Security Hardening
+  hosts: raspberrypis
+  become: true
+  gather_facts: true
+
+  ###############################################################################
+  # CONFIGURATION BLOCK — Edit all values here before running
+  ###############################################################################
+  vars:
+
+    # --------------------------------------------------------------------------
+    # CURRENT (PRE-HARDENING) ACCESS DETAILS
+    # These must reflect the Pi's current state so Ansible can connect.
+    # --------------------------------------------------------------------------
+    current_ssh_port: 22           # Current SSH port on the Pi (stock default: 22)
+    current_ssh_user: "pi"         # Current user Ansible will connect as (stock default: pi)
+
+    # --------------------------------------------------------------------------
+    # SSH HARDENING SETTINGS
+    # --------------------------------------------------------------------------
+    ssh_new_port: 2222             # Port SSH will be changed to (set same as current to skip port change)
+    ssh_allow_users: "pi"          # Space-separated list of users allowed SSH access after hardening
+
+    # Public key to deploy before disabling password auth.
+    # Set to the content of your ~/.ssh/id_ed25519.pub (or id_rsa.pub) on your
+    # Ansible control machine.  Example:
+    #   ssh_public_key: "ssh-ed25519 AAAAC3Nza... user@host"
+    ssh_public_key: ""             # REQUIRED — playbook will abort if empty
+
+    # SSH crypto hardening (set false to keep distro defaults)
+    ssh_harden_ciphers: true
+
+    # --------------------------------------------------------------------------
+    # ADMIN USER
+    # --------------------------------------------------------------------------
+    # If you want to create a dedicated admin account separate from 'pi', set
+    # create_admin_user: true and fill in the details below.
+    create_admin_user: false
+    admin_username: "adminuser"
+    admin_password: ""             # Pre-hashed password — generate with:
+                                   # python3 -c "import crypt; print(crypt.crypt('YOUR_PASSWORD'))"
+
+    # Remove 'pi' from the sudo group after admin user is created?
+    # Only effective when create_admin_user is true.
+    remove_pi_from_sudo: false
+
+    # --------------------------------------------------------------------------
+    # SECTION TOGGLES — Set true/false to enable/disable each hardening section
+    # --------------------------------------------------------------------------
+    do_system_updates:           true   # Apt upgrade + unattended-upgrades
+    do_auto_updates:             true   # Configure unattended-upgrades
+    do_password_policy:          true   # Install & configure libpam-pwquality
+    do_disable_unused_accounts:  true   # Lock games, news, uucp system accounts
+    do_ssh_hardening:            true   # Apply sshd_config hardening settings
+    do_ufw_firewall:             true   # Install & configure UFW
+    do_iptables_rules:           true   # Apply rate-limiting iptables rules
+    do_fail2ban:                 true   # Install & configure fail2ban
+    do_disable_services:         true   # Disable bluetooth, avahi-daemon, etc.
+    do_file_permissions:         true   # Tighten /etc/passwd, shadow, ssh dir perms
+    do_file_attributes:          true   # chattr +i on critical /etc files
+    do_mount_options:            true   # Add nodev/nosuid/noexec to /tmp, /var/tmp
+    do_kernel_hardening:         true   # Apply sysctl security parameters
+    do_apparmor:                 true   # Install & enable AppArmor
+    do_hardware_disable:         false  # Disable BT/WiFi/audio in config.txt (REVIEW FIRST)
+    do_aide:                     true   # Install AIDE file integrity monitor
+    do_logwatch:                 true   # Install & configure logwatch
+    do_tripwire:                 false  # Install Tripwire (interactive setup — see notes)
+    do_daily_security_script:    true   # Deploy daily security check cron script
+    do_port_scan_detection:      true   # Deploy port scan detection script
+    do_log2ram:                  true   # Install log2ram — keeps /var/log in RAM to protect SD card
+    do_vim:                      true   # Install VIM, set as default editor, disable mouse tracking
+
+    # --------------------------------------------------------------------------
+    # FIREWALL SETTINGS
+    # --------------------------------------------------------------------------
+    # Local network CIDR — used to restrict HTTP/HTTPS access in UFW rules.
+    # Set to your actual LAN subnet, e.g. "192.168.0.0/24"
+    local_network_cidr: "192.168.1.0/24"
+
+    # Additional UFW rules — list of {port, proto, from} dicts.
+    # 'from' is optional; omit to allow from anywhere.
+    # Example:
+    #   ufw_extra_rules:
+    #     - { port: 80, proto: tcp, from: "192.168.1.0/24" }
+    ufw_extra_rules: []
+
+    # --------------------------------------------------------------------------
+    # HARDWARE DISABLE SETTINGS (only used when do_hardware_disable: true)
+    # --------------------------------------------------------------------------
+    hw_disable_bluetooth: true
+    hw_disable_wifi:      false   # Only set true if you are using Ethernet only
+    hw_disable_audio:     false
+    hw_disable_camera:    false
+
+    # --------------------------------------------------------------------------
+    # SERVICES TO DISABLE
+    # --------------------------------------------------------------------------
+    services_to_disable:
+      - bluetooth
+      - avahi-daemon
+      - triggerhappy
+
+    # --------------------------------------------------------------------------
+    # LOGWATCH / ALERTING
+    # --------------------------------------------------------------------------
+    alert_email: "admin@example.com"   # Email address for security reports & alerts
+
+    # --------------------------------------------------------------------------
+    # LOG2RAM SETTINGS (only used when do_log2ram: true)
+    # --------------------------------------------------------------------------
+    # log2ram mounts /var/log as a tmpfs RAM disk and syncs to the SD card
+    # periodically and on shutdown, dramatically reducing SD card write wear.
+    #
+    # log2ram_size   -- how much RAM to reserve for /var/log.
+    #                  Too small and log2ram will fail to sync at shutdown.
+    #                  Check current log usage with: du -sh /var/log
+    #                  Recommended starting values:
+    #                    40M  -- minimal Pi (headless, few services)
+    #                    100M -- typical hardened Pi (fail2ban, aide, logwatch)
+    #                    200M -- Pi running many services or verbose logging
+    #
+    # log2ram_mail   -- send an email if the RAM disk runs low (true/false).
+    #                  Requires a working mail relay on the Pi.
+    #
+    # log2ram_use_rsync -- use rsync instead of cp for sync-to-disk.
+    #                     Recommended true; requires rsync to be installed.
+    log2ram_size:       "100M"
+    log2ram_mail:       true
+    log2ram_use_rsync:  true
+
+    # --------------------------------------------------------------------------
+    # REPORTING
+    # --------------------------------------------------------------------------
+    report_dir: "/var/log/security-hardening"   # Where before/after reports are stored
+
+  ###############################################################################
+  # PRE-TASKS: Validate config, set connection port
+  ###############################################################################
+  pre_tasks:
+
+    - name: Abort if ssh_public_key is not set
+      ansible.builtin.fail:
+        msg: >
+          ssh_public_key is empty. Set it in the vars section to the contents
+          of your public key file (e.g. ~/.ssh/id_ed25519.pub) before running.
+      when: ssh_public_key == ""
+      tags: [always]
+
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0750"
+        owner: root
+        group: root
+      tags: [always]
+
+  ###############################################################################
+  # ROLE / TASK SECTIONS
+  ###############################################################################
+  tasks:
+
+    # ==========================================================================
+    # SECTION 0 — PRE-HARDENING REPORT
+    # ==========================================================================
+    - name: "[REPORT] Collect pre-hardening state"
+      tags: [report, harden]
+      block:
+
+        - name: "[REPORT-PRE] Gather OS info"
+          ansible.builtin.command: uname -a
+          register: pre_uname
+          changed_when: false
+
+        - name: "[REPORT-PRE] Gather OS release"
+          ansible.builtin.command: cat /etc/os-release
+          register: pre_os_release
+          changed_when: false
+
+        - name: "[REPORT-PRE] List enabled services"
+          ansible.builtin.command: systemctl list-unit-files --state=enabled --no-pager
+          register: pre_services
+          changed_when: false
+
+        - name: "[REPORT-PRE] List open ports"
+          ansible.builtin.command: ss -tuln
+          register: pre_ports
+          changed_when: false
+
+        - name: "[REPORT-PRE] Check UFW status"
+          ansible.builtin.command: ufw status verbose
+          register: pre_ufw
+          changed_when: false
+          failed_when: false
+
+        - name: "[REPORT-PRE] Read sshd_config"
+          ansible.builtin.command: cat /etc/ssh/sshd_config
+          register: pre_sshd
+          changed_when: false
+
+        - name: "[REPORT-PRE] List user accounts"
+          ansible.builtin.command: "cut -d: -f1,3,7 /etc/passwd"
+          register: pre_users
+          changed_when: false
+
+        - name: "[REPORT-PRE] Read sysctl values"
+          ansible.builtin.command: sysctl -a
+          register: pre_sysctl
+          changed_when: false
+          failed_when: false
+
+        - name: "[REPORT-PRE] Check AppArmor status"
+          ansible.builtin.command: aa-status
+          register: pre_apparmor
+          changed_when: false
+          failed_when: false
+
+        - name: "[REPORT-PRE] Check fail2ban status"
+          ansible.builtin.command: fail2ban-client status
+          register: pre_fail2ban
+          changed_when: false
+          failed_when: false
+
+        - name: "[REPORT-PRE] Check /etc/fstab"
+          ansible.builtin.command: cat /etc/fstab
+          register: pre_fstab
+          changed_when: false
+
+        - name: "[REPORT-PRE] Write pre-hardening report"
+          ansible.builtin.copy:
+            dest: "{{ report_dir }}/pre-hardening-report.txt"
+            mode: "0640"
+            content: |
+              ============================================================
+              PRE-HARDENING SECURITY REPORT
+              Host    : {{ inventory_hostname }}
+              Date    : {{ ansible_date_time.iso8601 }}
+              ============================================================
+
+              --- OS INFO ---
+              {{ pre_uname.stdout }}
+              {{ pre_os_release.stdout }}
+
+              --- USER ACCOUNTS (name:uid:shell) ---
+              {{ pre_users.stdout }}
+
+              --- ENABLED SERVICES ---
+              {{ pre_services.stdout }}
+
+              --- OPEN PORTS (ss -tuln) ---
+              {{ pre_ports.stdout }}
+
+              --- UFW STATUS ---
+              {{ pre_ufw.stdout | default('ufw not installed') }}
+
+              --- SSHD CONFIG ---
+              {{ pre_sshd.stdout }}
+
+              --- SYSCTL SECURITY-RELEVANT VALUES ---
+              {{ pre_sysctl.stdout | default('could not read sysctl') }}
+
+              --- APPARMOR STATUS ---
+              {{ pre_apparmor.stdout | default('AppArmor not installed') }}
+
+              --- FAIL2BAN STATUS ---
+              {{ pre_fail2ban.stdout | default('fail2ban not installed') }}
+
+              --- /etc/fstab ---
+              {{ pre_fstab.stdout }}
+
+              ============================================================
+              END OF PRE-HARDENING REPORT
+              ============================================================
+
+    # ==========================================================================
+    # SECTION 1 — SYSTEM UPDATES
+    # ==========================================================================
+    - name: "1. System updates"
+      tags: [harden, updates]
+      when: do_system_updates
+      block:
+
+        - name: "[UPDATES] Apt cache update"
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: "[UPDATES] Full system upgrade"
+          ansible.builtin.apt:
+            upgrade: full
+
+        - name: "[UPDATES] Install unattended-upgrades"
+          ansible.builtin.apt:
+            name: unattended-upgrades
+            state: present
+          when: do_auto_updates
+
+        - name: "[UPDATES] Configure unattended-upgrades"
+          ansible.builtin.blockinfile:
+            path: /etc/apt/apt.conf.d/50unattended-upgrades
+            create: true
+            marker: "// {mark} ANSIBLE MANAGED BLOCK"
+            block: |
+              Unattended-Upgrade::Automatic-Reboot "false";
+              Unattended-Upgrade::Automatic-Reboot-Time "02:00";
+              Unattended-Upgrade::Remove-Unused-Dependencies "true";
+          when: do_auto_updates
+
+        - name: "[UPDATES] Enable unattended-upgrades service"
+          ansible.builtin.service:
+            name: unattended-upgrades
+            enabled: true
+            state: started
+          when: do_auto_updates
+
+    # ==========================================================================
+    # SECTION 2 — USER ACCOUNT SECURITY
+    # ==========================================================================
+    - name: "2. User account security"
+      tags: [harden, users]
+      block:
+
+        - name: "[USERS] Install libpam-pwquality"
+          ansible.builtin.apt:
+            name: libpam-pwquality
+            state: present
+          when: do_password_policy
+
+        - name: "[USERS] Configure password quality policy"
+          ansible.builtin.blockinfile:
+            path: /etc/security/pwquality.conf
+            create: true
+            marker: "# {mark} ANSIBLE MANAGED BLOCK"
+            block: |
+              minlen = 12
+              ucredit = -1
+              lcredit = -1
+              dcredit = -1
+              ocredit = -1
+              remember = 5
+              dictcheck = 1
+          when: do_password_policy
+
+        - name: "[USERS] Create dedicated admin user"
+          ansible.builtin.user:
+            name: "{{ admin_username }}"
+            groups: sudo
+            append: true
+            shell: /bin/bash
+            password: "{{ admin_password }}"
+            create_home: true
+          when: create_admin_user and admin_username != ""
+
+        - name: "[USERS] Remove pi from sudo group"
+          ansible.builtin.command: deluser pi sudo
+          when: create_admin_user and remove_pi_from_sudo
+          changed_when: true
+          failed_when: false
+
+        - name: "[USERS] Disable unused system accounts (shell → /bin/false)"
+          ansible.builtin.user:
+            name: "{{ item }}"
+            shell: /bin/false
+          loop:
+            - games
+            - news
+            - uucp
+          failed_when: false
+          when: do_disable_unused_accounts
+
+        - name: "[USERS] Lock unused system accounts"
+          ansible.builtin.command: passwd -l {{ item }}
+          loop:
+            - games
+            - news
+            - uucp
+          changed_when: true
+          failed_when: false
+          when: do_disable_unused_accounts
+
+    # ==========================================================================
+    # SECTION 3 — SSH HARDENING
+    # ==========================================================================
+    - name: "3. SSH hardening"
+      tags: [harden, ssh]
+      when: do_ssh_hardening
+      block:
+
+        - name: "[SSH] Ensure .ssh directory exists for current user"
+          ansible.builtin.file:
+            path: "/home/{{ current_ssh_user }}/.ssh"
+            state: directory
+            mode: "0700"
+            owner: "{{ current_ssh_user }}"
+            group: "{{ current_ssh_user }}"
+
+        - name: "[SSH] Deploy public key"
+          ansible.posix.authorized_key:
+            user: "{{ current_ssh_user }}"
+            state: present
+            key: "{{ ssh_public_key }}"
+
+        - name: "[SSH] Backup original sshd_config"
+          ansible.builtin.copy:
+            src: /etc/ssh/sshd_config
+            dest: /etc/ssh/sshd_config.backup
+            remote_src: true
+            force: false
+            mode: "0600"
+
+        - name: "[SSH] Set Port"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?Port '
+            line: "Port {{ ssh_new_port }}"
+
+        - name: "[SSH] Disable root login"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?PermitRootLogin'
+            line: "PermitRootLogin no"
+
+        - name: "[SSH] Disable password authentication"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?PasswordAuthentication'
+            line: "PasswordAuthentication no"
+
+        - name: "[SSH] Enable public key authentication"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?PubkeyAuthentication'
+            line: "PubkeyAuthentication yes"
+
+        - name: "[SSH] Set AuthorizedKeysFile"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?AuthorizedKeysFile'
+            line: "AuthorizedKeysFile .ssh/authorized_keys"
+
+        - name: "[SSH] Set AllowUsers"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?AllowUsers'
+            line: "AllowUsers {{ ssh_allow_users }}"
+
+        - name: "[SSH] Set MaxAuthTries"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?MaxAuthTries'
+            line: "MaxAuthTries 3"
+
+        - name: "[SSH] Set MaxSessions"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?MaxSessions'
+            line: "MaxSessions 2"
+
+        - name: "[SSH] Set ClientAliveInterval"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?ClientAliveInterval'
+            line: "ClientAliveInterval 300"
+
+        - name: "[SSH] Set ClientAliveCountMax"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?ClientAliveCountMax'
+            line: "ClientAliveCountMax 2"
+
+        - name: "[SSH] Disable X11Forwarding"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?X11Forwarding'
+            line: "X11Forwarding no"
+
+        - name: "[SSH] Disable AllowTcpForwarding"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?AllowTcpForwarding'
+            line: "AllowTcpForwarding no"
+
+        - name: "[SSH] Disable GatewayPorts"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?GatewayPorts'
+            line: "GatewayPorts no"
+
+        - name: "[SSH] Disable PermitTunnel"
+          ansible.builtin.lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^#?PermitTunnel'
+            line: "PermitTunnel no"
+
+        - name: "[SSH] Harden ciphers, MACs and KEX"
+          ansible.builtin.blockinfile:
+            path: /etc/ssh/sshd_config
+            marker: "# {mark} ANSIBLE MANAGED — CRYPTO"
+            block: |
+              Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+              MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com
+              KexAlgorithms curve25519-sha256@libssh.org,diffie-hellman-group16-sha512
+          when: ssh_harden_ciphers
+
+        - name: "[SSH] Validate sshd config before restart"
+          ansible.builtin.command: sshd -t
+          changed_when: false
+
+        - name: "[SSH] Restart SSH service"
+          ansible.builtin.service:
+            name: ssh
+            state: restarted
+
+        - name: "[SSH] Update ansible_port for remainder of play"
+          ansible.builtin.set_fact:
+            ansible_port: "{{ ssh_new_port }}"
+
+    # ==========================================================================
+    # SECTION 4 — FIREWALL (UFW)
+    # ==========================================================================
+    - name: "4. UFW Firewall"
+      tags: [harden, firewall]
+      when: do_ufw_firewall
+      block:
+
+        - name: "[UFW] Install ufw"
+          ansible.builtin.apt:
+            name: ufw
+            state: present
+
+        - name: "[UFW] Set default deny incoming"
+          community.general.ufw:
+            default: deny
+            direction: incoming
+
+        - name: "[UFW] Set default allow outgoing"
+          community.general.ufw:
+            default: allow
+            direction: outgoing
+
+        - name: "[UFW] Allow SSH on new port"
+          community.general.ufw:
+            rule: allow
+            port: "{{ ssh_new_port }}"
+            proto: tcp
+
+        - name: "[UFW] Allow HTTP from local network"
+          community.general.ufw:
+            rule: allow
+            port: "80"
+            proto: tcp
+            src: "{{ local_network_cidr }}"
+
+        - name: "[UFW] Allow HTTPS from local network"
+          community.general.ufw:
+            rule: allow
+            port: "443"
+            proto: tcp
+            src: "{{ local_network_cidr }}"
+
+        - name: "[UFW] Apply extra UFW rules"
+          community.general.ufw:
+            rule: allow
+            port: "{{ item.port }}"
+            proto: "{{ item.proto | default('tcp') }}"
+            src: "{{ item.from | default('any') }}"
+          loop: "{{ ufw_extra_rules }}"
+
+        - name: "[UFW] Enable UFW"
+          community.general.ufw:
+            state: enabled
+
+    # ==========================================================================
+    # SECTION 4b — iptables rate limiting
+    # ==========================================================================
+    - name: "4b. iptables rate-limiting rules"
+      tags: [harden, firewall, iptables]
+      when: do_iptables_rules
+      block:
+
+        - name: "[IPTABLES] Install iptables-persistent"
+          ansible.builtin.apt:
+            name: iptables-persistent
+            state: present
+
+        - name: "[IPTABLES] Deploy rules.v4"
+          ansible.builtin.template:
+            src: templates/iptables-rules.v4.j2
+            dest: /etc/iptables/rules.v4
+            mode: "0640"
+            owner: root
+            group: root
+
+        - name: "[IPTABLES] Apply rules"
+          ansible.builtin.command: iptables-restore /etc/iptables/rules.v4
+          changed_when: true
+
+    # ==========================================================================
+    # SECTION 5 — FAIL2BAN
+    # ==========================================================================
+    - name: "5. fail2ban"
+      tags: [harden, fail2ban]
+      when: do_fail2ban
+      block:
+
+        - name: "[FAIL2BAN] Install fail2ban"
+          ansible.builtin.apt:
+            name: fail2ban
+            state: present
+
+        - name: "[FAIL2BAN] Deploy jail.local"
+          ansible.builtin.template:
+            src: templates/jail.local.j2
+            dest: /etc/fail2ban/jail.local
+            mode: "0644"
+            owner: root
+            group: root
+
+        - name: "[FAIL2BAN] Enable and start fail2ban"
+          ansible.builtin.service:
+            name: fail2ban
+            enabled: true
+            state: restarted
+
+    # ==========================================================================
+    # SECTION 6 — DISABLE UNNECESSARY SERVICES
+    # ==========================================================================
+    - name: "6. Disable unnecessary services"
+      tags: [harden, services]
+      when: do_disable_services
+      block:
+
+        - name: "[SERVICES] Stop and disable services"
+          ansible.builtin.service:
+            name: "{{ item }}"
+            enabled: false
+            state: stopped
+          loop: "{{ services_to_disable }}"
+          failed_when: false
+
+    # ==========================================================================
+    # SECTION 7 — FILE SYSTEM SECURITY
+    # ==========================================================================
+    - name: "7. File system security"
+      tags: [harden, filesystem]
+      block:
+
+        - name: "[FS] Set permissions on /etc/passwd"
+          ansible.builtin.file:
+            path: /etc/passwd
+            mode: "0644"
+            owner: root
+            group: root
+          when: do_file_permissions
+
+        - name: "[FS] Set permissions on /etc/shadow"
+          ansible.builtin.file:
+            path: /etc/shadow
+            mode: "0600"
+            owner: root
+            group: shadow
+          when: do_file_permissions
+
+        - name: "[FS] Set permissions on /etc/gshadow"
+          ansible.builtin.file:
+            path: /etc/gshadow
+            mode: "0600"
+            owner: root
+            group: shadow
+          when: do_file_permissions
+
+        - name: "[FS] Set permissions on /etc/group"
+          ansible.builtin.file:
+            path: /etc/group
+            mode: "0644"
+            owner: root
+            group: root
+          when: do_file_permissions
+
+        - name: "[FS] Set permissions on .ssh directory"
+          ansible.builtin.file:
+            path: "/home/{{ current_ssh_user }}/.ssh"
+            mode: "0700"
+            owner: "{{ current_ssh_user }}"
+            group: "{{ current_ssh_user }}"
+          when: do_file_permissions
+
+        - name: "[FS] Set permissions on authorized_keys"
+          ansible.builtin.file:
+            path: "/home/{{ current_ssh_user }}/.ssh/authorized_keys"
+            mode: "0600"
+            owner: "{{ current_ssh_user }}"
+            group: "{{ current_ssh_user }}"
+          failed_when: false
+          when: do_file_permissions
+
+        - name: "[FS] Install attr (for chattr support)"
+          ansible.builtin.apt:
+            name: attr
+            state: present
+          when: do_file_attributes
+
+        - name: "[FS] Make /etc/passwd immutable"
+          ansible.builtin.command: chattr +i /etc/passwd
+          changed_when: true
+          when: do_file_attributes
+
+        - name: "[FS] Make /etc/shadow immutable"
+          ansible.builtin.command: chattr +i /etc/shadow
+          changed_when: true
+          when: do_file_attributes
+
+        - name: "[FS] Make /etc/group immutable"
+          ansible.builtin.command: chattr +i /etc/group
+          changed_when: true
+          when: do_file_attributes
+
+        - name: "[FS] Add tmpfs /tmp with security options to fstab"
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: '^tmpfs\s+/tmp\s'
+            line: "tmpfs /tmp tmpfs defaults,rw,nosuid,nodev,noexec,relatime 0 0"
+          when: do_mount_options
+
+        - name: "[FS] Add tmpfs /var/tmp with security options to fstab"
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: '^tmpfs\s+/var/tmp\s'
+            line: "tmpfs /var/tmp tmpfs defaults,rw,nosuid,nodev,noexec,relatime 0 0"
+          when: do_mount_options
+
+        - name: "[FS] Remount /tmp"
+          ansible.builtin.command: mount -o remount /tmp
+          changed_when: true
+          failed_when: false
+          when: do_mount_options
+
+    # ==========================================================================
+    # SECTION 8 — KERNEL HARDENING (sysctl)
+    # ==========================================================================
+    - name: "8. Kernel hardening"
+      tags: [harden, kernel]
+      when: do_kernel_hardening
+      block:
+
+        - name: "[KERNEL] Apply security sysctl parameters"
+          ansible.posix.sysctl:
+            name: "{{ item.key }}"
+            value: "{{ item.value }}"
+            state: present
+            reload: true
+            sysctl_file: /etc/sysctl.d/99-rpi-hardening.conf
+          loop:
+            - { key: "net.ipv4.ip_forward",                        value: "0" }
+            - { key: "net.ipv4.conf.all.send_redirects",           value: "0" }
+            - { key: "net.ipv4.conf.default.send_redirects",       value: "0" }
+            - { key: "net.ipv4.conf.all.accept_redirects",         value: "0" }
+            - { key: "net.ipv4.conf.default.accept_redirects",     value: "0" }
+            - { key: "net.ipv4.conf.all.accept_source_route",      value: "0" }
+            - { key: "net.ipv4.conf.default.accept_source_route",  value: "0" }
+            - { key: "net.ipv4.conf.all.log_martians",             value: "1" }
+            - { key: "net.ipv4.icmp_echo_ignore_broadcasts",       value: "1" }
+            - { key: "net.ipv4.icmp_ignore_bogus_error_responses", value: "1" }
+            - { key: "net.ipv4.tcp_syncookies",                    value: "1" }
+            - { key: "kernel.randomize_va_space",                  value: "2" }
+
+    # ==========================================================================
+    # SECTION 9 — APPARMOR
+    # ==========================================================================
+    - name: "9. AppArmor"
+      tags: [harden, apparmor]
+      when: do_apparmor
+      block:
+
+        - name: "[APPARMOR] Install apparmor and tools"
+          ansible.builtin.apt:
+            name:
+              - apparmor
+              - apparmor-utils
+            state: present
+
+        - name: "[APPARMOR] Enable AppArmor at boot"
+          ansible.builtin.lineinfile:
+            path: /boot/firmware/cmdline.txt
+            regexp: '(.*)(apparmor=\d+\s+security=apparmor)?(.*)'
+            line: "{{ lookup('file', '/boot/firmware/cmdline.txt') | regex_replace('apparmor=\\d+\\s+security=apparmor', '') | trim }} apparmor=1 security=apparmor"
+          failed_when: false
+
+        - name: "[APPARMOR] Enable and start AppArmor service"
+          ansible.builtin.service:
+            name: apparmor
+            enabled: true
+            state: started
+
+    # ==========================================================================
+    # SECTION 10 — HARDWARE INTERFACE DISABLE
+    # ==========================================================================
+    - name: "10. Disable unused hardware interfaces"
+      tags: [harden, hardware]
+      when: do_hardware_disable
+      block:
+
+        - name: "[HW] Disable Bluetooth in config.txt"
+          ansible.builtin.lineinfile:
+            path: /boot/firmware/config.txt
+            regexp: '^#?dtoverlay=disable-bt'
+            line: "dtoverlay=disable-bt"
+          when: hw_disable_bluetooth
+
+        - name: "[HW] Disable WiFi in config.txt"
+          ansible.builtin.lineinfile:
+            path: /boot/firmware/config.txt
+            regexp: '^#?dtoverlay=disable-wifi'
+            line: "dtoverlay=disable-wifi"
+          when: hw_disable_wifi
+
+        - name: "[HW] Disable audio in config.txt"
+          ansible.builtin.lineinfile:
+            path: /boot/firmware/config.txt
+            regexp: '^#?dtparam=audio='
+            line: "dtparam=audio=off"
+          when: hw_disable_audio
+
+        - name: "[HW] Disable camera in config.txt"
+          ansible.builtin.lineinfile:
+            path: /boot/firmware/config.txt
+            regexp: '^#?start_x='
+            line: "start_x=0"
+          when: hw_disable_camera
+
+    # ==========================================================================
+    # SECTION 11 — AIDE (File Integrity Monitoring)
+    # ==========================================================================
+    - name: "11. AIDE file integrity monitoring"
+      tags: [harden, aide]
+      when: do_aide
+      block:
+
+        - name: "[AIDE] Install aide"
+          ansible.builtin.apt:
+            name: aide
+            state: present
+
+        - name: "[AIDE] Initialise AIDE database (may take several minutes)"
+          ansible.builtin.command: aide --init
+          args:
+            creates: /var/lib/aide/aide.db.new
+          changed_when: true
+
+        - name: "[AIDE] Move new database into place"
+          ansible.builtin.command: mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+          args:
+            creates: /var/lib/aide/aide.db
+          changed_when: true
+
+        - name: "[AIDE] Deploy daily AIDE check cron script"
+          ansible.builtin.copy:
+            dest: /etc/cron.daily/aide-check
+            mode: "0755"
+            owner: root
+            group: root
+            content: |
+              #!/bin/bash
+              AIDE_LOG="/var/log/aide.log"
+              DATE=$(date +%Y-%m-%d)
+              echo "AIDE Check - $DATE" >> $AIDE_LOG
+              /usr/bin/aide --check >> $AIDE_LOG 2>&1
+              if [ $? -ne 0 ]; then
+                echo "AIDE detected changes on $(hostname)!" | \
+                  mail -s "AIDE Alert - $(hostname)" {{ alert_email }}
+              fi
+
+    # ==========================================================================
+    # SECTION 12 — LOGWATCH
+    # ==========================================================================
+    - name: "12. LogWatch"
+      tags: [harden, logwatch]
+      when: do_logwatch
+      block:
+
+        - name: "[LOGWATCH] Install logwatch"
+          ansible.builtin.apt:
+            name: logwatch
+            state: present
+
+        - name: "[LOGWATCH] Configure logwatch"
+          ansible.builtin.copy:
+            dest: /etc/logwatch/conf/logwatch.conf
+            mode: "0644"
+            owner: root
+            group: root
+            content: |
+              MailTo = {{ alert_email }}
+              MailFrom = pi@{{ ansible_hostname }}
+              Detail = Med
+              Service = sshd
+              Service = kernel
+              Service = fail2ban
+
+    # ==========================================================================
+    # SECTION 13 — TRIPWIRE (optional — requires interactive setup)
+    # ==========================================================================
+    - name: "13. Tripwire"
+      tags: [harden, tripwire]
+      when: do_tripwire
+      block:
+
+        - name: "[TRIPWIRE] Install tripwire"
+          ansible.builtin.apt:
+            name: tripwire
+            state: present
+          # NOTE: tripwire-setup-keyfiles and --init are interactive and must
+          # be run manually after installation. See README for instructions.
+
+    # ==========================================================================
+    # SECTION 14 — DAILY SECURITY SCRIPT
+    # ==========================================================================
+    - name: "14. Daily security check script"
+      tags: [harden, monitoring]
+      when: do_daily_security_script
+      block:
+
+        - name: "[CRON] Deploy daily security check script"
+          ansible.builtin.copy:
+            dest: /etc/cron.daily/security-check
+            mode: "0755"
+            owner: root
+            group: root
+            content: |
+              #!/bin/bash
+              REPORT="/tmp/daily-security-report.txt"
+              DATE=$(date +%Y-%m-%d)
+              echo "Daily Security Report - $DATE" > $REPORT
+              echo "================================" >> $REPORT
+              echo "Failed Login Attempts:" >> $REPORT
+              grep "Failed password" /var/log/auth.log | tail -10 >> $REPORT
+              echo -e "\nCurrent Users:" >> $REPORT
+              cut -d: -f1 /etc/passwd >> $REPORT
+              echo -e "\nListening Ports:" >> $REPORT
+              ss -tuln >> $REPORT
+              echo -e "\nFirewall Status:" >> $REPORT
+              ufw status >> $REPORT
+              mail -s "Daily Security Report - $(hostname)" {{ alert_email }} < $REPORT
+
+    # ==========================================================================
+    # SECTION 15 — PORT SCAN DETECTION SCRIPT
+    # ==========================================================================
+    - name: "15. Port scan detection script"
+      tags: [harden, monitoring]
+      when: do_port_scan_detection
+      block:
+
+        - name: "[PORTSCAN] Deploy port scan detection script"
+          ansible.builtin.copy:
+            dest: /usr/local/bin/portscan-detect.sh
+            mode: "0755"
+            owner: root
+            group: root
+            content: |
+              #!/bin/bash
+              LOGFILE="/var/log/portscan.log"
+              tail -f /var/log/kern.log | while read line; do
+                if echo "$line" | grep -q "SYN flood"; then
+                  echo "$(date): Potential SYN flood detected" >> $LOGFILE
+                  echo "SYN flood detected on $(hostname)" | \
+                    mail -s "Security Alert" {{ alert_email }}
+                fi
+              done
+
+        - name: "[PORTSCAN] Install systemd unit for port scan detection"
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/portscan-detect.service
+            mode: "0644"
+            owner: root
+            group: root
+            content: |
+              [Unit]
+              Description=Port Scan Detection
+              After=network.target
+
+              [Service]
+              ExecStart=/usr/local/bin/portscan-detect.sh
+              Restart=always
+              RestartSec=10
+
+              [Install]
+              WantedBy=multi-user.target
+
+        - name: "[PORTSCAN] Enable port scan detection service"
+          ansible.builtin.systemd:
+            name: portscan-detect
+            enabled: true
+            daemon_reload: true
+            state: started
+
+    # ==========================================================================
+    # SECTION 17 -- LOG2RAM (SD card write protection)
+    # ==========================================================================
+    - name: "17. log2ram — RAM-backed /var/log"
+      tags: [harden, log2ram]
+      when: do_log2ram
+      block:
+
+        - name: "[LOG2RAM] Install prerequisites (rsync)"
+          ansible.builtin.apt:
+            name: rsync
+            state: present
+          when: log2ram_use_rsync
+
+        - name: "[LOG2RAM] Check if log2ram is already installed"
+          ansible.builtin.command: dpkg -s log2ram
+          register: log2ram_installed
+          changed_when: false
+          failed_when: false
+
+        - name: "[LOG2RAM] Add log2ram apt repository key"
+          ansible.builtin.get_url:
+            url: https://azlux.fr/repo.gpg.key
+            dest: /usr/share/keyrings/log2ram.gpg.asc
+            mode: "0644"
+          when: log2ram_installed.rc != 0
+
+        - name: "[LOG2RAM] Add log2ram apt repository"
+          ansible.builtin.apt_repository:
+            repo: "deb [signed-by=/usr/share/keyrings/log2ram.gpg.asc] https://packages.azlux.fr/debian/ bookworm main"
+            filename: log2ram
+            state: present
+          when: log2ram_installed.rc != 0
+
+        - name: "[LOG2RAM] Install log2ram"
+          ansible.builtin.apt:
+            name: log2ram
+            update_cache: true
+            state: present
+          when: log2ram_installed.rc != 0
+
+        - name: "[LOG2RAM] Configure SIZE in /etc/log2ram.conf"
+          ansible.builtin.lineinfile:
+            path: /etc/log2ram.conf
+            regexp: '^SIZE='
+            line: "SIZE={{ log2ram_size }}"
+
+        - name: "[LOG2RAM] Configure MAIL in /etc/log2ram.conf"
+          ansible.builtin.lineinfile:
+            path: /etc/log2ram.conf
+            regexp: '^MAIL='
+            line: "MAIL={{ log2ram_mail | lower }}"
+
+        - name: "[LOG2RAM] Configure USE_RSYNC in /etc/log2ram.conf"
+          ansible.builtin.lineinfile:
+            path: /etc/log2ram.conf
+            regexp: '^USE_RSYNC='
+            line: "USE_RSYNC={{ log2ram_use_rsync | lower }}"
+
+        - name: "[LOG2RAM] Enable log2ram service"
+          ansible.builtin.service:
+            name: log2ram
+            enabled: true
+
+        - name: "[LOG2RAM] Show reboot reminder"
+          ansible.builtin.debug:
+            msg: >
+              log2ram installed and configured with SIZE={{ log2ram_size }}.
+              A REBOOT IS REQUIRED for log2ram to mount /var/log into RAM.
+              After rebooting, verify with: systemctl status log2ram
+
+    # ==========================================================================
+    # SECTION 18 -- VIM EDITOR
+    # ==========================================================================
+    - name: "18. VIM — install, set default editor, disable mouse"
+      tags: [harden, vim]
+      when: do_vim
+      block:
+
+        - name: "[VIM] Install vim"
+          ansible.builtin.apt:
+            name: vim
+            state: present
+
+        - name: "[VIM] Set vim as system-wide default editor via update-alternatives"
+          community.general.alternatives:
+            name: editor
+            path: /usr/bin/vim.basic
+            priority: 60
+
+        - name: "[VIM] Deploy system-wide vimrc.local disabling mouse tracking"
+          ansible.builtin.copy:
+            dest: /etc/vim/vimrc.local
+            mode: "0644"
+            owner: root
+            group: root
+            content: |
+              " /etc/vim/vimrc.local — managed by Ansible
+              " Disable mouse tracking in all modes so terminal copy/paste works normally
+              set mouse=
+              " Sensible defaults for a server/security context
+              set nocompatible
+              syntax on
+              set number
+              set hlsearch
+              set incsearch
+              set background=dark
+
+        - name: "[VIM] Set EDITOR and VISUAL in /etc/environment"
+          ansible.builtin.blockinfile:
+            path: /etc/environment
+            create: true
+            mode: "0644"
+            marker: "# {mark} ANSIBLE MANAGED — VIM DEFAULT EDITOR"
+            block: |
+              EDITOR=/usr/bin/vim.basic
+              VISUAL=/usr/bin/vim.basic
+
+    # ==========================================================================
+    # SECTION 19 -- POST-HARDENING REPORT
+    # ==========================================================================
+    - name: "[REPORT] Collect post-hardening state"
+      tags: [report, harden]
+      block:
+
+        - name: "[REPORT-POST] Gather enabled services"
+          ansible.builtin.command: systemctl list-unit-files --state=enabled --no-pager
+          register: post_services
+          changed_when: false
+
+        - name: "[REPORT-POST] Gather open ports"
+          ansible.builtin.command: ss -tuln
+          register: post_ports
+          changed_when: false
+
+        - name: "[REPORT-POST] Check UFW status"
+          ansible.builtin.command: ufw status verbose
+          register: post_ufw
+          changed_when: false
+          failed_when: false
+
+        - name: "[REPORT-POST] Read sshd_config"
+          ansible.builtin.command: cat /etc/ssh/sshd_config
+          register: post_sshd
+          changed_when: false
+
+        - name: "[REPORT-POST] List user accounts"
+          ansible.builtin.command: "cut -d: -f1,3,7 /etc/passwd"
+          register: post_users
+          changed_when: false
+
+        - name: "[REPORT-POST] Read sysctl values"
+          ansible.builtin.command: sysctl -a
+          register: post_sysctl
+          changed_when: false
+          failed_when: false
+
+        - name: "[REPORT-POST] Check AppArmor status"
+          ansible.builtin.command: aa-status
+          register: post_apparmor
+          changed_when: false
+          failed_when: false
+
+        - name: "[REPORT-POST] Check fail2ban status"
+          ansible.builtin.command: fail2ban-client status
+          register: post_fail2ban
+          changed_when: false
+          failed_when: false
+
+        - name: "[REPORT-POST] Check /etc/fstab"
+          ansible.builtin.command: cat /etc/fstab
+          register: post_fstab
+          changed_when: false
+
+        - name: "[REPORT-POST] Read file attributes on critical files"
+          ansible.builtin.command: lsattr /etc/passwd /etc/shadow /etc/group
+          register: post_attrs
+          changed_when: false
+          failed_when: false
+
+        - name: "[REPORT-POST] Check log2ram status"
+          ansible.builtin.command: systemctl status log2ram
+          register: post_log2ram
+          changed_when: false
+          failed_when: false
+
+        - name: "[REPORT-POST] Read log2ram config"
+          ansible.builtin.command: cat /etc/log2ram.conf
+          register: post_log2ram_conf
+          changed_when: false
+          failed_when: false
+
+        - name: "[REPORT-POST] Write post-hardening report"
+          ansible.builtin.copy:
+            dest: "{{ report_dir }}/post-hardening-report.txt"
+            mode: "0640"
+            content: |
+              ============================================================
+              POST-HARDENING SECURITY REPORT
+              Host    : {{ inventory_hostname }}
+              Date    : {{ ansible_date_time.iso8601 }}
+              ============================================================
+
+              --- USER ACCOUNTS (name:uid:shell) ---
+              {{ post_users.stdout }}
+
+              --- ENABLED SERVICES ---
+              {{ post_services.stdout }}
+
+              --- OPEN PORTS (ss -tuln) ---
+              {{ post_ports.stdout }}
+
+              --- UFW STATUS ---
+              {{ post_ufw.stdout | default('ufw not installed') }}
+
+              --- SSHD CONFIG ---
+              {{ post_sshd.stdout }}
+
+              --- SYSCTL SECURITY-RELEVANT VALUES ---
+              {{ post_sysctl.stdout | default('could not read sysctl') }}
+
+              --- APPARMOR STATUS ---
+              {{ post_apparmor.stdout | default('AppArmor not installed') }}
+
+              --- FAIL2BAN STATUS ---
+              {{ post_fail2ban.stdout | default('fail2ban not installed') }}
+
+              --- /etc/fstab ---
+              {{ post_fstab.stdout }}
+
+              --- FILE ATTRIBUTES (passwd/shadow/group) ---
+              {{ post_attrs.stdout | default('chattr not available') }}
+
+              --- LOG2RAM STATUS ---
+              {{ post_log2ram.stdout | default('log2ram not installed') }}
+
+              --- LOG2RAM CONFIG (/etc/log2ram.conf) ---
+              {{ post_log2ram_conf.stdout | default('not found') }}
+
+              ============================================================
+              HARDENING SECTIONS APPLIED
+              ============================================================
+              System updates           : {{ do_system_updates }}
+              Auto updates             : {{ do_auto_updates }}
+              Password policy          : {{ do_password_policy }}
+              Disable unused accounts  : {{ do_disable_unused_accounts }}
+              SSH hardening            : {{ do_ssh_hardening }}
+              UFW firewall             : {{ do_ufw_firewall }}
+              iptables rate limiting   : {{ do_iptables_rules }}
+              fail2ban                 : {{ do_fail2ban }}
+              Disable services         : {{ do_disable_services }}
+              File permissions         : {{ do_file_permissions }}
+              File attributes (chattr) : {{ do_file_attributes }}
+              Mount options            : {{ do_mount_options }}
+              Kernel hardening         : {{ do_kernel_hardening }}
+              AppArmor                 : {{ do_apparmor }}
+              Hardware disable         : {{ do_hardware_disable }}
+              AIDE                     : {{ do_aide }}
+              LogWatch                 : {{ do_logwatch }}
+              Tripwire                 : {{ do_tripwire }}
+              Daily security script    : {{ do_daily_security_script }}
+              Port scan detection      : {{ do_port_scan_detection }}
+              log2ram (SD protection)  : {{ do_log2ram }}
+              VIM default editor       : {{ do_vim }}
+
+              ============================================================
+              END OF POST-HARDENING REPORT
+              ============================================================
+
+        - name: "[REPORT] Reports written"
+          ansible.builtin.debug:
+            msg:
+              - "Pre-hardening  : {{ report_dir }}/pre-hardening-report.txt"
+              - "Post-hardening : {{ report_dir }}/post-hardening-report.txt"

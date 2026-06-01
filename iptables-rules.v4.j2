@@ -1,0 +1,23 @@
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+
+# Allow loopback
+-A INPUT -i lo -j ACCEPT
+
+# Allow established and related connections
+-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# Allow SSH from local network (with rate limiting)
+-A INPUT -p tcp -s {{ local_network_cidr }} --dport {{ ssh_new_port }} -m conntrack --ctstate NEW -m recent --set
+-A INPUT -p tcp -s {{ local_network_cidr }} --dport {{ ssh_new_port }} -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 -j DROP
+-A INPUT -p tcp -s {{ local_network_cidr }} --dport {{ ssh_new_port }} -j ACCEPT
+
+# Allow ICMP (ping) from local network only
+-A INPUT -p icmp -s {{ local_network_cidr }} -j ACCEPT
+
+# Log dropped packets (rate-limited to avoid log flooding)
+-A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables-DROP: " --log-level 7
+
+COMMIT
