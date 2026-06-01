@@ -1,4 +1,3 @@
-# RPI-Hardening-Playbook
 # 🔒 Raspberry Pi Security Hardening
 
 [![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](CHANGELOG.md)
@@ -46,7 +45,7 @@ reports are written to the Pi automatically on each run.
 ## Repository Structure
 
 ```
-rpi-security-hardening/
+RPI-Hardening-Playbook/
 ├── rpi_harden.yml              # Main playbook — all hardening logic
 ├── inventory.ini.example       # Inventory template — copy and edit
 ├── templates/
@@ -105,8 +104,8 @@ ssh pi@<pi-ip> "python3 --version"
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/rpi-security-hardening.git
-cd rpi-security-hardening
+git clone https://github.com/n8xja/RPI-Hardening-Playbook.git
+cd RPI-Hardening-Playbook
 ```
 
 ### 2. Create your inventory file

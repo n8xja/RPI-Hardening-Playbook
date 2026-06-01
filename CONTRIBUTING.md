@@ -22,8 +22,8 @@ This project uses [Semantic Versioning](https://semver.org): `MAJOR.MINOR.PATCH`
 ### 1. Fork and branch
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/rpi-security-hardening.git
-cd rpi-security-hardening
+git clone https://github.com/n8xja/RPI-Hardening-Playbook.git
+cd RPI-Hardening-Playbook
 git checkout -b feature/my-new-section   # or fix/descriptive-name
 ```
 
@@ -90,7 +90,7 @@ And add a line to the inline changelog in the same header:
 ```
 And add a comparison link at the bottom of the file:
 ```markdown
-[1.4.0]: https://github.com/YOUR_USERNAME/rpi-security-hardening/compare/v1.3.0...v1.4.0
+[1.4.0]: https://github.com/n8xja/RPI-Hardening-Playbook/compare/v1.3.0...v1.4.0
 ```
 
 ### 6. Commit and open a PR

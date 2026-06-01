@@ -104,7 +104,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-[1.3.0]: https://github.com/YOUR_USERNAME/rpi-security-hardening/compare/v1.2.0...v1.3.0
-[1.2.0]: https://github.com/YOUR_USERNAME/rpi-security-hardening/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/YOUR_USERNAME/rpi-security-hardening/compare/v1.0.0...v1.1.0
-[1.0.0]: https://github.com/YOUR_USERNAME/rpi-security-hardening/releases/tag/v1.0.0
+[1.3.0]: https://github.com/n8xja/RPI-Hardening-Playbook/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/n8xja/RPI-Hardening-Playbook/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/n8xja/RPI-Hardening-Playbook/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/n8xja/RPI-Hardening-Playbook/releases/tag/v1.0.0
