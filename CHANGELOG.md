@@ -7,6 +7,32 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.4.0] — 2025-01-01
+
+### Added
+- **Local deployment mode** — playbook now supports running directly on the Pi
+  via `ansible_connection=local`, in addition to the existing remote SSH mode.
+- `deployment_mode` variable (`"remote"` or `"local"`) in the config block to
+  select execution mode.
+- `inventory.local.ini` — pre-configured inventory for local execution.
+- Deployment mode shown in playbook output at startup and in the
+  post-hardening report summary.
+
+### Changed
+- `ssh_public_key` validation now skipped in local mode (no key to deploy).
+- `[SSH] Ensure .ssh directory` and `[SSH] Deploy public key` tasks now gated
+  on `deployment_mode == "remote"`.
+- `[SSH] Update ansible_port` set_fact task now gated on remote mode (no live
+  SSH connection to update in local mode).
+- `[SSH]` section emits a debug reminder in local mode to manually place the
+  SSH public key before disconnecting.
+- README rewritten with full side-by-side capability comparison table,
+  separate quickstart instructions for each mode, and explicit SSH lockout
+  warnings for local mode.
+- CHANGELOG, CONTRIBUTING, and playbook header updated to v1.4.0.
+
+---
+
 ## [1.3.0] — 2025-01-01
 
 ### Added
@@ -104,6 +130,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+[1.4.0]: https://github.com/n8xja/RPI-Hardening-Playbook/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/n8xja/RPI-Hardening-Playbook/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/n8xja/RPI-Hardening-Playbook/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/n8xja/RPI-Hardening-Playbook/compare/v1.0.0...v1.1.0

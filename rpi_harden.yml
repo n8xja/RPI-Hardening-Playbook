@@ -1,22 +1,30 @@
 ---
 ###############################################################################
 # Raspberry Pi Security Hardening Playbook
-# Version : 1.3.0
+# Version : 1.4.0
 # Repo    : https://github.com/n8xja/RPI-Hardening-Playbook
 # Based on: https://ohyaan.github.io/tips/raspberry_pi_security_hardening_complete_guide/
 #
 # Changelog:
+#   1.4.0 — Add local deployment mode; both remote and local execution supported
 #   1.3.0 — Add VIM installation, set as default editor, disable mouse tracking
 #   1.2.0 — Add log2ram support to protect SD card from log write wear
 #   1.1.0 — Add all hardening sections: SSH, firewall, kernel, AppArmor,
 #            AIDE, fail2ban, logwatch, daily scripts, port scan detection
 #   1.0.0 — Initial release: pre/post reporting, section toggle framework
 #
-# Usage:
-#   ansible-playbook -i inventory.ini rpi_harden.yml --ask-become-pass
-#   ansible-playbook -i inventory.ini rpi_harden.yml --tags report   # report only
-#   ansible-playbook -i inventory.ini rpi_harden.yml --tags harden   # harden only
-#   ansible-playbook -i inventory.ini rpi_harden.yml --check --diff  # dry run
+# DEPLOYMENT MODES
+#   REMOTE (default) — run from a separate control machine over SSH:
+#     ansible-playbook -i inventory.ini rpi_harden.yml --ask-become-pass
+#     ansible-playbook -i inventory.ini rpi_harden.yml --tags report --ask-become-pass
+#     ansible-playbook -i inventory.ini rpi_harden.yml --check --diff --ask-become-pass
+#
+#   LOCAL — run directly on the Pi itself (use inventory.local.ini):
+#     sudo ansible-playbook -i inventory.local.ini rpi_harden.yml
+#     sudo ansible-playbook -i inventory.local.ini rpi_harden.yml --tags report
+#     sudo ansible-playbook -i inventory.local.ini rpi_harden.yml --check --diff
+#
+#   See README.md — "Deployment Modes" for a full comparison of capabilities.
 ###############################################################################
 
 - name: Raspberry Pi Security Hardening
@@ -30,8 +38,22 @@
   vars:
 
     # --------------------------------------------------------------------------
+    # DEPLOYMENT MODE
+    # Set to "remote" when running from a separate control machine over SSH.
+    # Set to "local"  when running directly on the Pi itself.
+    #
+    # In local mode:
+    #   - ssh_public_key validation is skipped (no remote key to deploy)
+    #   - The authorized_key deployment task is skipped
+    #   - The ansible_port update task is skipped (no SSH connection to update)
+    #   - Run with: sudo ansible-playbook -i inventory.local.ini rpi_harden.yml
+    # --------------------------------------------------------------------------
+    deployment_mode: "remote"      # "remote" or "local"
+
+    # --------------------------------------------------------------------------
     # CURRENT (PRE-HARDENING) ACCESS DETAILS
     # These must reflect the Pi's current state so Ansible can connect.
+    # Only relevant in remote mode.
     # --------------------------------------------------------------------------
     current_ssh_port: 22           # Current SSH port on the Pi (stock default: 22)
     current_ssh_user: "pi"         # Current user Ansible will connect as (stock default: pi)
@@ -46,7 +68,8 @@
     # Set to the content of your ~/.ssh/id_ed25519.pub (or id_rsa.pub) on your
     # Ansible control machine.  Example:
     #   ssh_public_key: "ssh-ed25519 AAAAC3Nza... user@host"
-    ssh_public_key: ""             # REQUIRED — playbook will abort if empty
+    # In local mode this is ignored — set deployment_mode: "local" to skip it.
+    ssh_public_key: ""             # REQUIRED in remote mode; ignored in local mode
 
     # SSH crypto hardening (set false to keep distro defaults)
     ssh_harden_ciphers: true
@@ -159,12 +182,21 @@
   ###############################################################################
   pre_tasks:
 
-    - name: Abort if ssh_public_key is not set
+    - name: Abort if ssh_public_key is not set (remote mode only)
       ansible.builtin.fail:
         msg: >
           ssh_public_key is empty. Set it in the vars section to the contents
           of your public key file (e.g. ~/.ssh/id_ed25519.pub) before running.
-      when: ssh_public_key == ""
+          If you are running locally on the Pi, set deployment_mode: "local"
+          to skip this check.
+      when:
+        - deployment_mode == "remote"
+        - ssh_public_key == ""
+      tags: [always]
+
+    - name: Show deployment mode
+      ansible.builtin.debug:
+        msg: "Deployment mode: {{ deployment_mode | upper }} — {{ 'running on the Pi itself via local connection' if deployment_mode == 'local' else 'connecting to Pi over SSH from control machine' }}"
       tags: [always]
 
     - name: Ensure report directory exists
@@ -407,19 +439,29 @@
       when: do_ssh_hardening
       block:
 
-        - name: "[SSH] Ensure .ssh directory exists for current user"
+        - name: "[SSH] Ensure .ssh directory exists for current user (remote mode)"
           ansible.builtin.file:
             path: "/home/{{ current_ssh_user }}/.ssh"
             state: directory
             mode: "0700"
             owner: "{{ current_ssh_user }}"
             group: "{{ current_ssh_user }}"
+          when: deployment_mode == "remote"
 
-        - name: "[SSH] Deploy public key"
+        - name: "[SSH] Deploy public key (remote mode only)"
           ansible.posix.authorized_key:
             user: "{{ current_ssh_user }}"
             state: present
             key: "{{ ssh_public_key }}"
+          when: deployment_mode == "remote"
+
+        - name: "[SSH] Local mode — reminder to add SSH key manually"
+          ansible.builtin.debug:
+            msg: >
+              LOCAL MODE: Public key deployment skipped. After the playbook
+              completes, add your SSH public key manually before your next
+              remote login: ssh-copy-id -p {{ ssh_new_port }} {{ current_ssh_user }}@<pi-ip>
+          when: deployment_mode == "local"
 
         - name: "[SSH] Backup original sshd_config"
           ansible.builtin.copy:
@@ -532,9 +574,10 @@
             name: ssh
             state: restarted
 
-        - name: "[SSH] Update ansible_port for remainder of play"
+        - name: "[SSH] Update ansible_port for remainder of play (remote mode)"
           ansible.builtin.set_fact:
             ansible_port: "{{ ssh_new_port }}"
+          when: deployment_mode == "remote"
 
     # ==========================================================================
     # SECTION 4 — FIREWALL (UFW)
@@ -1256,6 +1299,7 @@
               ============================================================
               HARDENING SECTIONS APPLIED
               ============================================================
+              Deployment mode          : {{ deployment_mode | upper }}
               System updates           : {{ do_system_updates }}
               Auto updates             : {{ do_auto_updates }}
               Password policy          : {{ do_password_policy }}
